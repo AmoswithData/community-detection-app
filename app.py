@@ -22,6 +22,9 @@ from gatpso_model import (
     load_uploaded_dataset,
     pca_projection,
     run_gatpso_pipeline,
+    ScalabilityConfig,
+    run_scalability_analysis,
+    summarize_scalability_results,
 )
 
 
@@ -116,7 +119,133 @@ CUSTOM_CSS = """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 PLOTLY_TEMPLATE = "plotly_dark"
+DEVICE_PREFERENCE = "auto"
 
+
+def render_scalability_results(raw_df, summary_df):
+    """
+    Display scalability results as raw tables, summary tables and dark themed Plotly charts.
+    The function is defensive: it still displays raw failures/skips and explains why charts
+    cannot be drawn when the summary is empty.
+    """
+
+    st.subheader("Raw Scalability Trial Results")
+
+    if raw_df is None or raw_df.empty:
+        st.warning("No scalability trial results are available yet.")
+        return
+
+    st.dataframe(raw_df, use_container_width=True, hide_index=True)
+
+    status_counts = raw_df.get("status")
+    if status_counts is not None:
+        st.caption("Trial status counts")
+        st.dataframe(status_counts.value_counts(dropna=False).rename_axis("status").reset_index(name="count"), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        label="Download Raw Scalability Results CSV",
+        data=raw_df.to_csv(index=False).encode("utf-8"),
+        file_name="gatpso_raw_scalability_results.csv",
+        mime="text/csv",
+        key="download_raw_scalability",
+    )
+
+    if summary_df is None or summary_df.empty:
+        st.warning(
+            "No scalability charts are available because no successful runs were summarized. "
+            "Check the raw results table, especially the status and error columns."
+        )
+        return
+
+    st.subheader("Summarized Scalability Results")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        label="Download Summary Scalability Results CSV",
+        data=summary_df.to_csv(index=False).encode("utf-8"),
+        file_name="gatpso_summary_scalability_results.csv",
+        mime="text/csv",
+        key="download_summary_scalability",
+    )
+
+    st.markdown("---")
+    st.subheader("Scalability Visualizations")
+
+    chart_df = summary_df.copy()
+    if "requested_nodes" not in chart_df.columns:
+        st.warning("The summary table has no requested_nodes column, so scalability charts cannot be drawn.")
+        return
+
+    chart_df["requested_nodes"] = pd.to_numeric(chart_df["requested_nodes"], errors="coerce")
+    for col in chart_df.columns:
+        if col != "requested_nodes":
+            chart_df[col] = pd.to_numeric(chart_df[col], errors="coerce")
+
+    def plot_scalability_line(y_cols, title, y_title):
+        available_cols = [col for col in y_cols if col in chart_df.columns]
+        if not available_cols:
+            st.info(f"No available columns for: {title}")
+            return
+
+        long_df = chart_df[["requested_nodes"] + available_cols].melt(
+            id_vars="requested_nodes",
+            value_vars=available_cols,
+            var_name="metric",
+            value_name="value",
+        ).dropna(subset=["requested_nodes", "value"])
+
+        if long_df.empty:
+            st.info(f"No numeric values available for: {title}")
+            return
+
+        fig = px.line(
+            long_df,
+            x="requested_nodes",
+            y="value",
+            color="metric",
+            markers=True,
+            template=PLOTLY_TEMPLATE,
+            title=title,
+        )
+        fig.update_layout(
+            paper_bgcolor="#050505",
+            plot_bgcolor="#111111",
+            font_color="#ffffff",
+            xaxis_title="Requested Nodes",
+            yaxis_title=y_title,
+            legend_title_text="Metric",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    plot_scalability_line(
+        ["train_seconds_mean", "pso_seconds_mean", "total_seconds_mean"],
+        "Runtime Growth by Graph Size",
+        "Seconds",
+    )
+
+    plot_scalability_line(
+        ["memory_mb_mean", "memory_delta_mb_mean"],
+        "Memory Usage Growth by Graph Size",
+        "Memory MB",
+    )
+
+    plot_scalability_line(
+        ["modularity_mean", "separation_mean", "conductance_mean"],
+        "Community Quality Metrics by Graph Size",
+        "Metric Value",
+    )
+
+    plot_scalability_line(
+        ["NMI_mean", "ARI_mean"],
+        "External Validation Metrics by Graph Size",
+        "Metric Value",
+    )
+
+    plot_scalability_line(
+        ["communities_mean", "selected_k_mean"],
+        "Number of Communities Identified by Graph Size",
+        "Count",
+    )
 
 def write_uploaded_file(uploaded_file) -> Optional[str]:
     if uploaded_file is None:
@@ -284,7 +413,7 @@ def build_result_zip(result: Dict) -> bytes:
 st.markdown(
     """
     <div class="hero-card">
-        <div class="hero-title">GAT-PSO Community Detection Web App</div>
+        <div class="hero-title">Community Detection with GATPSO hybrid model</div>
         <div class="hero-subtitle">
             Upload your own graph dataset or run benchmark datasets such as Cora, PubMed and Citeseer.
             The app trains a GAT/DGI embedding model, applies K-means and PSO, then explains the detected
@@ -362,7 +491,7 @@ with st.sidebar:
     seed = st.number_input("Random seed", min_value=1, max_value=9999, value=42, step=1)
 
     run_button = st.button("Run Model", use_container_width=True)
-
+    st.markdown("---")
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     st.markdown(
@@ -473,8 +602,17 @@ if run_button:
                     f"score={metrics['score']:.4f}, modularity={metrics['modularity']:.4f}, separation={metrics['separation']:.4f}"
                 )
 
-            result = run_gatpso_pipeline(loaded, cfg, train_callback=train_callback, pso_callback=pso_callback)
+            result = run_gatpso_pipeline(
+                loaded,
+                cfg,
+                device_preference=DEVICE_PREFERENCE,
+                train_callback=train_callback,
+                pso_callback=pso_callback,
+            )
             st.session_state["gatpso_result"] = result
+            st.session_state["gatpso_loaded"] = loaded
+            st.session_state["gatpso_cfg"] = cfg
+            st.session_state["gatpso_device_preference"] = DEVICE_PREFERENCE
             status.update(label="Model run completed successfully.", state="complete", expanded=False)
     except Exception as exc:
         st.error(f"Model run failed: {exc}")
@@ -537,8 +675,7 @@ else:
     with tab_reps:
         st.markdown(
             """
-            ### How representative nodes are selected
-            The app uses the same reasoning as the notebook: a representative node should be both **central in the embedding space** and **well connected inside its own community**.
+            ###The app uses the same reasoning as the notebook: a representative node should be both **central in the embedding space** and **well connected inside its own community**.
 
             **Representative score = 0.5 × centroid proximity + 0.5 × normalized intra-community degree**
 
@@ -572,3 +709,164 @@ else:
             mime="text/csv",
             use_container_width=True,
         )
+
+st.divider()
+st.header("Scalability Testing")
+st.write(
+    """
+    Run controlled scalability tests on the currently loaded dataset. The app creates graph samples of
+    increasing node size, reruns the model, and visualizes runtime, memory usage and quality metrics.
+    """
+)
+
+if "gatpso_loaded" not in st.session_state or "gatpso_cfg" not in st.session_state:
+    st.info("Run the main model first. Scalability testing uses the same loaded dataset and base model configuration.")
+else:
+    loaded_for_scaling = st.session_state["gatpso_loaded"]
+    cfg_for_scaling = st.session_state["gatpso_cfg"]
+    device_for_scaling = st.session_state.get("gatpso_device_preference", DEVICE_PREFERENCE)
+
+    total_available_nodes = loaded_for_scaling.graph.number_of_nodes()
+    st.caption(
+        f"Current source: {loaded_for_scaling.source_description} | "
+        f"Available nodes: {total_available_nodes:,} | Available edges: {loaded_for_scaling.graph.number_of_edges():,}"
+    )
+
+    with st.expander("Scalability Test Configurations", expanded=False):
+        default_node_sizes = "500,1000,1500,2000,2500"
+        if total_available_nodes < 2500:
+            candidates = sorted({max(2, int(total_available_nodes * pct)) for pct in (0.25, 0.50, 0.75, 1.00)})
+            default_node_sizes = ",".join(str(x) for x in candidates)
+
+        node_sizes_text = st.text_input(
+            "Node sizes to test",
+            value=default_node_sizes,
+            help="Enter comma-separated node sizes. Example: 500,1000,1500,2000,2500",
+            key="scale_node_sizes_text",
+        )
+
+        repeats = st.number_input(
+            "Repeated trials per node size",
+            min_value=1,
+            max_value=10,
+            value=3,
+            step=1,
+            help="Use at least 3 repeats for more reliable scalability results.",
+            key="scale_repeats",
+        )
+
+        sampling_method = st.selectbox(
+            "Sampling method",
+            options=["snowball", "random"],
+            index=0,
+            help="Snowball sampling is recommended because it preserves local graph structure.",
+            key="scale_sampling_method",
+        )
+
+        scale_epochs = st.number_input(
+            "Epochs for scalability runs",
+            min_value=5,
+            max_value=500,
+            value=min(30, int(cfg_for_scaling.epochs)),
+            step=5,
+            key="scale_epochs",
+        )
+
+        scale_swarm_size = st.number_input(
+            "PSO swarm size for scalability runs",
+            min_value=2,
+            max_value=100,
+            value=min(6, int(cfg_for_scaling.swarm_size)),
+            step=1,
+            key="scale_swarm_size",
+        )
+
+        scale_max_iter = st.number_input(
+            "PSO iterations for scalability runs",
+            min_value=2,
+            max_value=200,
+            value=min(15, int(cfg_for_scaling.max_iter)),
+            step=1,
+            key="scale_max_iter",
+        )
+
+        modularity_edge_sample = st.number_input(
+            "Modularity edge sample",
+            min_value=1_000,
+            max_value=500_000,
+            value=20_000,
+            step=1_000,
+            help="Limits modularity calculation cost on larger graphs.",
+            key="scale_modularity_edge_sample",
+        )
+
+    run_scalability = st.button("Run Scalability Test", type="primary", key="run_scalability_button")
+
+    if run_scalability:
+        try:
+            node_sizes = tuple(
+                int(size.strip())
+                for size in node_sizes_text.split(",")
+                if size.strip()
+            )
+
+            if not node_sizes:
+                st.error("Please provide at least one node size.")
+                st.stop()
+
+            scale_cfg = ScalabilityConfig(
+                node_sizes=node_sizes,
+                repeats=int(repeats),
+                sampling_method=sampling_method,
+                seed=int(cfg_for_scaling.seed),
+                largest_component_only=True,
+                skip_sizes_larger_than_graph=True,
+                use_sample_label_count_for_k=True,
+                epochs=int(scale_epochs),
+                swarm_size=int(scale_swarm_size),
+                max_iter=int(scale_max_iter),
+                modularity_edge_sample=int(modularity_edge_sample),
+                pso_enabled=True,
+            )
+
+            progress_bar = st.progress(0)
+            status_box = st.empty()
+            total_runs = len(node_sizes) * int(repeats)
+            completed_runs = {"count": 0}
+
+            def progress_callback(row):
+                completed_runs["count"] += 1
+                requested_nodes = row.get("requested_nodes")
+                trial = row.get("trial")
+                status = row.get("status")
+
+                progress_bar.progress(min(completed_runs["count"] / max(total_runs, 1), 1.0))
+                status_box.info(
+                    f"Completed {completed_runs['count']}/{total_runs} runs | "
+                    f"Requested nodes: {requested_nodes} | Trial: {trial} | Status: {status}"
+                )
+
+            with st.spinner("Running scalability tests..."):
+                raw_scalability_results = run_scalability_analysis(
+                    loaded=loaded_for_scaling,
+                    base_cfg=cfg_for_scaling,
+                    scale_cfg=scale_cfg,
+                    device_preference=device_for_scaling,
+                    progress_callback=progress_callback,
+                )
+
+                summary_scalability_results = summarize_scalability_results(raw_scalability_results)
+
+            st.session_state["raw_scalability_results"] = raw_scalability_results
+            st.session_state["summary_scalability_results"] = summary_scalability_results
+            st.success("Scalability testing completed.")
+
+        except Exception as exc:
+            st.error(f"Scalability test failed: {exc}")
+
+    if "raw_scalability_results" in st.session_state:
+        render_scalability_results(
+            st.session_state.get("raw_scalability_results"),
+            st.session_state.get("summary_scalability_results"),
+        )
+
