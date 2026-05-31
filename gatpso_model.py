@@ -55,27 +55,353 @@ class ModelConfig:
     max_nodes: Optional[int] = None
     seed: int = 42
 
-    hidden_dim: int = 16
-    embedding_dim: int = 16
-    heads: int = 2
-    dropout: float = 0.35
+    hidden_dim: int = 64
+    embedding_dim: int = 64
+    heads: int = 4
+    dropout: float = 0.2
     epochs: int = 30
-    lr: float = 0.003
+    lr: float = 0.001
     weight_decay: float = 5e-4
 
     k_min: int = 2
     k_max: int = 10
     known_k: Optional[int] = None
-    swarm_size: int = 6
-    max_iter: int = 15
-    alpha_modularity: float = 0.75
-    beta_separation: float = 0.25
+    swarm_size: int = 20
+    max_iter: int = 80
+    alpha_modularity: float = 0.45
+    beta_separation: float = 0.35
+    gamma_balance: float = 0.20
     modularity_edge_sample: Optional[int] = 20_000
 
     top_representatives: int = 5
     pso_enabled: bool = True
 
+# -----------------------------------------------------------------------------
+# Scalability sampling and repeated-trial evaluation
+# -----------------------------------------------------------------------------
 
+@dataclass
+class ScalabilityConfig:
+
+    node_sizes: Tuple[int, ...] = (500, 1_000, 2_500, 5_000, 10_000)
+    repeats: int = 3
+    sampling_method: str = "snowball"  # options: "snowball", "random"
+    seed: int = 42
+    largest_component_only: bool = True
+    skip_sizes_larger_than_graph: bool = True
+    use_sample_label_count_for_k: bool = True
+
+    
+    epochs: Optional[int] = None
+    swarm_size: Optional[int] = None
+    max_iter: Optional[int] = None
+    modularity_edge_sample: Optional[int] = 20_000
+    pso_enabled: Optional[bool] = None
+def _largest_component_subgraph(graph: nx.Graph) -> nx.Graph:
+    """Return the largest connected component as a copied graph."""
+    if graph.number_of_nodes() == 0:
+        return graph.copy()
+    if nx.is_connected(graph):
+        return graph.copy()
+    largest_nodes = max(nx.connected_components(graph), key=len)
+    return graph.subgraph(largest_nodes).copy()
+
+
+def _random_node_sample(graph: nx.Graph, target_nodes: int, seed: int) -> List[int]:
+    """Uniformly sample nodes from the graph."""
+    rng = np.random.default_rng(seed)
+    nodes = np.array(list(graph.nodes()))
+    sample_size = min(target_nodes, len(nodes))
+    return sorted(rng.choice(nodes, size=sample_size, replace=False).tolist())
+
+
+def _snowball_node_sample(graph: nx.Graph, target_nodes: int, seed: int) -> List[int]:
+    """
+    Sample nodes using a BFS/snowball expansion.
+
+    This is preferred for scalability testing because it preserves local graph
+    structure better than pure random node sampling, which can create many
+    disconnected fragments.
+    """
+    rng = np.random.default_rng(seed)
+    all_nodes = list(graph.nodes())
+
+    if target_nodes >= len(all_nodes):
+        return sorted(all_nodes)
+
+    start_node = rng.choice(all_nodes)
+    visited = {start_node}
+    frontier = [start_node]
+
+    while frontier and len(visited) < target_nodes:
+        current = frontier.pop(0)
+        neighbours = list(graph.neighbors(current))
+        rng.shuffle(neighbours)
+
+        for neighbour in neighbours:
+            if neighbour not in visited:
+                visited.add(neighbour)
+                frontier.append(neighbour)
+
+                if len(visited) >= target_nodes:
+                    break
+
+    # If the start area was too small, fill the remaining nodes randomly.
+    if len(visited) < target_nodes:
+        remaining = [node for node in all_nodes if node not in visited]
+        extra_count = min(target_nodes - len(visited), len(remaining))
+
+        if extra_count > 0:
+            visited.update(
+                rng.choice(remaining, size=extra_count, replace=False).tolist()
+            )
+
+    return sorted(visited)
+def sample_loaded_graph_for_scalability(
+    loaded: LoadedGraph,
+    target_nodes: int,
+    seed: int,
+    method: str = "snowball",
+    largest_component_only: bool = True,
+    use_sample_label_count_for_k: bool = True,
+) -> LoadedGraph:
+    """
+    Create a sampled LoadedGraph while keeping features and labels aligned.
+
+    Important alignment rule:
+    The original LoadedGraph is already remapped to integer node IDs. Therefore,
+    sampled node IDs can be used directly to slice loaded.features and loaded.labels.
+    """
+    graph = loaded.graph
+
+    if graph.number_of_nodes() < 2:
+        raise GATPSOError("Scalability sampling requires at least two graph nodes.")
+
+    if method.lower() == "snowball":
+        sampled_old_nodes = _snowball_node_sample(graph, target_nodes, seed)
+    elif method.lower() == "random":
+        sampled_old_nodes = _random_node_sample(graph, target_nodes, seed)
+    else:
+        raise GATPSOError("Unsupported sampling method. Use 'snowball' or 'random'.")
+
+    sampled_graph = graph.subgraph(sampled_old_nodes).copy()
+    sampled_graph.remove_edges_from(nx.selfloop_edges(sampled_graph))
+    sampled_graph.remove_nodes_from(list(nx.isolates(sampled_graph)))
+
+    if sampled_graph.number_of_nodes() < 2:
+        raise GATPSOError(
+            f"Sample with target_nodes={target_nodes} became too small after cleaning. "
+            "Try a larger node size or use snowball sampling."
+        )
+
+    if largest_component_only:
+        sampled_graph = _largest_component_subgraph(sampled_graph)
+
+    # Keep this sorted order so feature/label slicing matches the relabelled graph.
+    old_nodes = sorted(sampled_graph.nodes())
+    mapping = {old_node: new_node for new_node, old_node in enumerate(old_nodes)}
+    relabelled_graph = nx.relabel_nodes(sampled_graph, mapping, copy=True)
+
+    # Preserve the original ID and the parent node ID for traceability.
+    for old_node, new_node in mapping.items():
+        relabelled_graph.nodes[new_node]["original_id"] = graph.nodes[old_node].get(
+            "original_id", old_node
+        )
+        relabelled_graph.nodes[new_node]["sample_parent_node"] = int(old_node)
+
+    old_nodes_array = np.array(old_nodes, dtype=int)
+    sampled_features = loaded.features[old_nodes_array].astype(np.float32)
+
+    sampled_labels = None
+    if loaded.labels is not None:
+        sampled_labels = loaded.labels[old_nodes_array].astype(int)
+
+    if sampled_labels is not None and use_sample_label_count_for_k:
+        known_k = int(len(np.unique(sampled_labels)))
+    else:
+        known_k = loaded.known_k
+
+    return LoadedGraph(
+        graph=relabelled_graph,
+        features=sampled_features,
+        labels=sampled_labels,
+        known_k=known_k,
+        node_table=make_node_table(relabelled_graph),
+        source_description=(
+            f"Scalability sample from {loaded.source_description}; "
+            f"method={method}; requested_nodes={target_nodes}; "
+            f"actual_nodes={relabelled_graph.number_of_nodes()}"
+        ),
+    )
+def sample_loaded_graph_for_scalability(
+    loaded: LoadedGraph,
+    target_nodes: int,
+    seed: int,
+    method: str = "snowball",
+    largest_component_only: bool = True,
+    use_sample_label_count_for_k: bool = True,
+) -> LoadedGraph:
+    """
+    Create a sampled LoadedGraph while keeping features and labels aligned.
+
+    Important alignment rule:
+    The original LoadedGraph is already remapped to integer node IDs. Therefore,
+    sampled node IDs can be used directly to slice loaded.features and loaded.labels.
+    """
+    graph = loaded.graph
+
+    if graph.number_of_nodes() < 2:
+        raise GATPSOError("Scalability sampling requires at least two graph nodes.")
+
+    if method.lower() == "snowball":
+        sampled_old_nodes = _snowball_node_sample(graph, target_nodes, seed)
+    elif method.lower() == "random":
+        sampled_old_nodes = _random_node_sample(graph, target_nodes, seed)
+    else:
+        raise GATPSOError("Unsupported sampling method. Use 'snowball' or 'random'.")
+
+    sampled_graph = graph.subgraph(sampled_old_nodes).copy()
+    sampled_graph.remove_edges_from(nx.selfloop_edges(sampled_graph))
+    sampled_graph.remove_nodes_from(list(nx.isolates(sampled_graph)))
+
+    if sampled_graph.number_of_nodes() < 2:
+        raise GATPSOError(
+            f"Sample with target_nodes={target_nodes} became too small after cleaning. "
+            "Try a larger node size or use snowball sampling."
+        )
+
+    if largest_component_only:
+        sampled_graph = _largest_component_subgraph(sampled_graph)
+
+    # Keep this sorted order so feature/label slicing matches the relabelled graph.
+    old_nodes = sorted(sampled_graph.nodes())
+    mapping = {old_node: new_node for new_node, old_node in enumerate(old_nodes)}
+    relabelled_graph = nx.relabel_nodes(sampled_graph, mapping, copy=True)
+
+    # Preserve the original ID and the parent node ID for traceability.
+    for old_node, new_node in mapping.items():
+        relabelled_graph.nodes[new_node]["original_id"] = graph.nodes[old_node].get(
+            "original_id", old_node
+        )
+        relabelled_graph.nodes[new_node]["sample_parent_node"] = int(old_node)
+
+    old_nodes_array = np.array(old_nodes, dtype=int)
+    sampled_features = loaded.features[old_nodes_array].astype(np.float32)
+
+    sampled_labels = None
+    if loaded.labels is not None:
+        sampled_labels = loaded.labels[old_nodes_array].astype(int)
+
+    if sampled_labels is not None and use_sample_label_count_for_k:
+        known_k = int(len(np.unique(sampled_labels)))
+    else:
+        known_k = loaded.known_k
+
+    return LoadedGraph(
+        graph=relabelled_graph,
+        features=sampled_features,
+        labels=sampled_labels,
+        known_k=known_k,
+        node_table=make_node_table(relabelled_graph),
+        source_description=(
+            f"Scalability sample from {loaded.source_description}; "
+            f"method={method}; requested_nodes={target_nodes}; "
+            f"actual_nodes={relabelled_graph.number_of_nodes()}"
+        ),
+    )
+def _build_scalability_trial_config(
+    base_cfg: ModelConfig,
+    scale_cfg: ScalabilityConfig,
+    seed: int,
+) -> ModelConfig:
+    """Copy the base model configuration and apply scalability-specific overrides."""
+    trial_cfg = ModelConfig(**asdict(base_cfg))
+    trial_cfg.seed = int(seed)
+
+    # Sampling is handled explicitly by the scalability layer.
+    trial_cfg.max_nodes = None
+
+    if scale_cfg.epochs is not None:
+        trial_cfg.epochs = int(scale_cfg.epochs)
+
+    if scale_cfg.swarm_size is not None:
+        trial_cfg.swarm_size = int(scale_cfg.swarm_size)
+
+    if scale_cfg.max_iter is not None:
+        trial_cfg.max_iter = int(scale_cfg.max_iter)
+
+    if scale_cfg.modularity_edge_sample is not None:
+        trial_cfg.modularity_edge_sample = int(scale_cfg.modularity_edge_sample)
+
+    if scale_cfg.pso_enabled is not None:
+        trial_cfg.pso_enabled = bool(scale_cfg.pso_enabled)
+
+    return trial_cfg
+
+
+def _extract_final_model_row(results_df: pd.DataFrame) -> Dict[str, Any]:
+    """Return the PSO row when available; otherwise return the final available row."""
+    if results_df.empty:
+        return {}
+
+    pso_rows = results_df[
+        results_df["model"].astype(str).str.contains("PSO", case=False, na=False)
+    ]
+
+    if not pso_rows.empty:
+        return pso_rows.iloc[-1].to_dict()
+
+    return results_df.iloc[-1].to_dict()
+def summarize_scalability_results(results: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize repeated scalability results by requested node size.
+
+    Produces mean and standard deviation for the main scalability and quality
+    measures. Use this table for dissertation/report writing, not one-off runs.
+    """
+    if results.empty:
+        return pd.DataFrame()
+
+    ok = results[results["status"] == "ok"].copy()
+
+    if ok.empty:
+        return pd.DataFrame()
+
+    numeric_cols = [
+        "actual_nodes",
+        "edges",
+        "communities",
+        "selected_k",
+        "sampling_seconds",
+        "train_seconds",
+        "pso_seconds",
+        "total_seconds",
+        "memory_mb",
+        "memory_delta_mb",
+        "score",
+        "modularity",
+        "separation",
+        "conductance",
+        "NMI",
+        "ARI",
+    ]
+
+    numeric_cols = [col for col in numeric_cols if col in ok.columns]
+
+    summary = ok.groupby("requested_nodes")[numeric_cols].agg(
+        ["mean", "std", "min", "max"]
+    )
+
+    summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+    summary = summary.reset_index()
+
+    summary.insert(
+        1,
+        "trials_completed",
+        ok.groupby("requested_nodes").size().values,
+    )
+
+    return summary
 @dataclass
 class LoadedGraph:
     graph: nx.Graph
@@ -784,3 +1110,134 @@ def run_gatpso_pipeline(
             **runtime,
         },
     }
+
+
+def run_scalability_analysis(
+    loaded: LoadedGraph,
+    base_cfg: ModelConfig,
+    scale_cfg: ScalabilityConfig,
+    device_preference: str = "auto",
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> pd.DataFrame:
+    """
+    Run repeated scalability tests over fixed sample sizes.
+
+    The function returns one row per trial. Failed or skipped trials are retained
+    with a status and error message so that scalability testing remains auditable.
+    """
+    rows: List[Dict[str, Any]] = []
+    total_nodes = loaded.graph.number_of_nodes()
+
+    for requested_nodes in scale_cfg.node_sizes:
+        if requested_nodes > total_nodes and scale_cfg.skip_sizes_larger_than_graph:
+            row = {
+                "requested_nodes": int(requested_nodes),
+                "actual_nodes": None,
+                "edges": None,
+                "trial": None,
+                "seed": None,
+                "sampling_method": scale_cfg.sampling_method,
+                "status": "skipped",
+                "error": "Requested sample size is larger than the source graph.",
+            }
+            rows.append(row)
+            if progress_callback is not None:
+                progress_callback(row)
+            continue
+
+        for trial in range(1, scale_cfg.repeats + 1):
+            trial_seed = int(scale_cfg.seed + requested_nodes * 100 + trial)
+            row_base: Dict[str, Any] = {
+                "requested_nodes": int(requested_nodes),
+                "trial": int(trial),
+                "seed": int(trial_seed),
+                "sampling_method": scale_cfg.sampling_method,
+            }
+
+            try:
+                sampling_start = time.time()
+                sampled_loaded = sample_loaded_graph_for_scalability(
+                    loaded=loaded,
+                    target_nodes=int(requested_nodes),
+                    seed=trial_seed,
+                    method=scale_cfg.sampling_method,
+                    largest_component_only=scale_cfg.largest_component_only,
+                    use_sample_label_count_for_k=scale_cfg.use_sample_label_count_for_k,
+                )
+                sampling_seconds = time.time() - sampling_start
+
+                trial_cfg = _build_scalability_trial_config(
+                    base_cfg=base_cfg,
+                    scale_cfg=scale_cfg,
+                    seed=trial_seed,
+                )
+
+                result = run_gatpso_pipeline(
+                    loaded=sampled_loaded,
+                    cfg=trial_cfg,
+                    device_preference=device_preference,
+                )
+
+                final_row = _extract_final_model_row(result["results_df"])
+                summary = result["summary"]
+                runtime = result["runtime"]
+
+                row = {
+                    **row_base,
+                    "actual_nodes": int(summary.get("nodes", sampled_loaded.graph.number_of_nodes())),
+                    "edges": int(summary.get("edges", sampled_loaded.graph.number_of_edges())),
+                    "features": int(sampled_loaded.features.shape[1]),
+                    "selected_k": int(summary.get("selected_k", result.get("selected_k", 0))),
+                    "communities": int(summary.get("communities", 0)),
+                    "sampling_seconds": float(sampling_seconds),
+                    "train_seconds": float(runtime.get("train_seconds", np.nan)),
+                    "pso_seconds": float(runtime.get("pso_seconds", np.nan)),
+                    "total_seconds": float(runtime.get("total_seconds", np.nan)),
+                    "memory_mb": float(runtime.get("memory_mb", np.nan)),
+                    "memory_delta_mb": float(runtime.get("memory_delta_mb", np.nan)),
+                    "model": final_row.get("model"),
+                    "score": final_row.get("score"),
+                    "modularity": final_row.get("modularity"),
+                    "separation": final_row.get("separation"),
+                    "conductance": final_row.get("conductance"),
+                    "NMI": final_row.get("NMI"),
+                    "ARI": final_row.get("ARI"),
+                    "status": "ok",
+                    "error": None,
+                }
+
+            except Exception as exc:
+                row = {
+                    **row_base,
+                    "actual_nodes": None,
+                    "edges": None,
+                    "features": None,
+                    "selected_k": None,
+                    "communities": None,
+                    "sampling_seconds": None,
+                    "train_seconds": None,
+                    "pso_seconds": None,
+                    "total_seconds": None,
+                    "memory_mb": None,
+                    "memory_delta_mb": None,
+                    "model": None,
+                    "score": None,
+                    "modularity": None,
+                    "separation": None,
+                    "conductance": None,
+                    "NMI": None,
+                    "ARI": None,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+
+            rows.append(row)
+            if progress_callback is not None:
+                progress_callback(row)
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return pd.DataFrame(rows)
+
