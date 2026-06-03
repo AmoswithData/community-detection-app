@@ -53,6 +53,7 @@ class ModelConfig:
     use_planetoid: bool = True
     largest_component_only: bool = True
     max_nodes: Optional[int] = None
+    feature_mode: str = "combined"  # options: basic, enhanced, combined
     seed: int = 42
 
     hidden_dim: int = 64
@@ -232,6 +233,8 @@ def sample_loaded_graph_for_scalability(
             f"method={method}; requested_nodes={target_nodes}; "
             f"actual_nodes={relabelled_graph.number_of_nodes()}"
         ),
+        feature_names=loaded.feature_names,
+        feature_mode=loaded.feature_mode,
     )
 def sample_loaded_graph_for_scalability(
     loaded: LoadedGraph,
@@ -308,6 +311,8 @@ def sample_loaded_graph_for_scalability(
             f"method={method}; requested_nodes={target_nodes}; "
             f"actual_nodes={relabelled_graph.number_of_nodes()}"
         ),
+        feature_names=loaded.feature_names,
+        feature_mode=loaded.feature_mode,
     )
 def _build_scalability_trial_config(
     base_cfg: ModelConfig,
@@ -410,6 +415,8 @@ class LoadedGraph:
     known_k: Optional[int]
     node_table: pd.DataFrame
     source_description: str
+    feature_names: Optional[List[str]] = None
+    feature_mode: str = "unknown"
 
 
 class GATPSOError(RuntimeError):
@@ -471,15 +478,167 @@ def preprocess_graph_nx(
     return graph
 
 
-def build_structural_features(graph: nx.Graph) -> np.ndarray:
-    """Create notebook-style structural features for nodes without explicit attributes."""
+STRUCTURAL_FEATURE_NAMES_BASIC = [
+    "degree",
+    "log_degree",
+    "normalized_degree",
+    "bias",
+]
+
+STRUCTURAL_FEATURE_NAMES_ENHANCED = [
+    "degree",
+    "log_degree",
+    "normalized_degree",
+    "clustering_coefficient",
+    "pagerank",
+    "k_core_index",
+    "triangle_count",
+    "bias",
+]
+
+
+def _safe_standardize_columns(values: np.ndarray, keep_last_bias: bool = True) -> np.ndarray:
+    """Standardize structural features while keeping the constant bias column as 1."""
+    values = np.nan_to_num(values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+    if values.size == 0:
+        return values.astype(np.float32)
+
+    if keep_last_bias and values.shape[1] > 1:
+        non_bias = values[:, :-1]
+        bias = values[:, -1:]
+        scaled = StandardScaler().fit_transform(non_bias).astype(np.float32)
+        return np.hstack([scaled, bias.astype(np.float32)]).astype(np.float32)
+
+    return StandardScaler().fit_transform(values).astype(np.float32)
+
+
+def build_basic_structural_features(graph: nx.Graph, standardize: bool = True) -> np.ndarray:
+    """Create the original notebook-style structural feature set."""
     n_nodes = graph.number_of_nodes()
     degree = np.array([graph.degree(node) for node in range(n_nodes)], dtype=np.float32)
     log_degree = np.log1p(degree)
     max_degree = degree.max() if degree.size and degree.max() > 0 else 1.0
-    norm_degree = degree / max_degree
+    normalized_degree = degree / max_degree
     bias = np.ones(n_nodes, dtype=np.float32)
-    return np.vstack([degree, log_degree, norm_degree, bias]).T.astype(np.float32)
+
+    features = np.vstack([degree, log_degree, normalized_degree, bias]).T.astype(np.float32)
+    return _safe_standardize_columns(features, keep_last_bias=True) if standardize else features
+
+
+def build_enhanced_structural_features(graph: nx.Graph, standardize: bool = True) -> np.ndarray:
+    """
+    Create the enhanced structural feature team used by the improved model.
+
+    Feature team:
+    1. degree
+    2. log degree
+    3. normalized degree
+    4. clustering coefficient
+    5. PageRank
+    6. k-core index / core number
+    7. triangle count
+    8. bias
+    """
+    n_nodes = graph.number_of_nodes()
+    nodes = list(range(n_nodes))
+
+    degree = np.array([graph.degree(node) for node in nodes], dtype=np.float32)
+    log_degree = np.log1p(degree)
+    max_degree = degree.max() if degree.size and degree.max() > 0 else 1.0
+    normalized_degree = degree / max_degree
+
+    clustering_map = nx.clustering(graph) if n_nodes else {}
+    clustering_coefficient = np.array(
+        [clustering_map.get(node, 0.0) for node in nodes], dtype=np.float32
+    )
+
+    try:
+        pagerank_map = nx.pagerank(graph, alpha=0.85, max_iter=100, tol=1e-06)
+    except Exception:
+        pagerank_map = {node: 1.0 / max(n_nodes, 1) for node in nodes}
+    pagerank = np.array([pagerank_map.get(node, 0.0) for node in nodes], dtype=np.float32)
+
+    try:
+        core_map = nx.core_number(graph)
+    except Exception:
+        core_map = {node: 0 for node in nodes}
+    k_core_index = np.array([core_map.get(node, 0) for node in nodes], dtype=np.float32)
+
+    triangle_map = nx.triangles(graph) if n_nodes else {}
+    triangle_count = np.array([triangle_map.get(node, 0) for node in nodes], dtype=np.float32)
+
+    bias = np.ones(n_nodes, dtype=np.float32)
+
+    features = np.vstack(
+        [
+            degree,
+            log_degree,
+            normalized_degree,
+            clustering_coefficient,
+            pagerank,
+            k_core_index,
+            triangle_count,
+            bias,
+        ]
+    ).T.astype(np.float32)
+
+    return _safe_standardize_columns(features, keep_last_bias=True) if standardize else features
+
+
+def build_structural_features(
+    graph: nx.Graph,
+    mode: str = "enhanced",
+    standardize: bool = True,
+) -> np.ndarray:
+    """Build structural features according to the selected feature mode."""
+    mode = (mode or "enhanced").lower()
+
+    if mode == "basic":
+        return build_basic_structural_features(graph, standardize=standardize)
+
+    if mode in {"enhanced", "combined"}:
+        return build_enhanced_structural_features(graph, standardize=standardize)
+
+    raise GATPSOError(
+        "Unsupported feature_mode. Use 'basic', 'enhanced', or 'combined'."
+    )
+
+
+def combine_base_and_structural_features(
+    base_features: Optional[np.ndarray],
+    graph: nx.Graph,
+    feature_mode: str = "combined",
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Combine uploaded/benchmark node attributes with the structural feature team.
+
+    - basic: structural basic features only.
+    - enhanced: enhanced structural feature team only.
+    - combined: original node attributes + enhanced structural feature team.
+    """
+    feature_mode = (feature_mode or "combined").lower()
+
+    if feature_mode == "basic":
+        return build_basic_structural_features(graph), STRUCTURAL_FEATURE_NAMES_BASIC.copy()
+
+    structural_features = build_enhanced_structural_features(graph)
+    structural_names = STRUCTURAL_FEATURE_NAMES_ENHANCED.copy()
+
+    if feature_mode == "enhanced" or base_features is None:
+        return structural_features, structural_names
+
+    if feature_mode != "combined":
+        raise GATPSOError(
+            "Unsupported feature_mode. Use 'basic', 'enhanced', or 'combined'."
+        )
+
+    base_features = np.nan_to_num(
+        base_features.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    combined = np.hstack([base_features, structural_features]).astype(np.float32)
+    base_names = [f"attribute_{idx}" for idx in range(base_features.shape[1])]
+    return combined, base_names + structural_names
 
 
 def make_node_table(graph: nx.Graph) -> pd.DataFrame:
@@ -501,6 +660,7 @@ def load_benchmark_dataset(
     max_nodes: Optional[int] = None,
     seed: int = 42,
     root: str = "./benchmark_data",
+    feature_mode: str = "combined",
 ) -> LoadedGraph:
     """Load Cora, PubMed or Citeseer from PyTorch Geometric Planetoid."""
     _require_pyg()
@@ -521,7 +681,10 @@ def load_benchmark_dataset(
     graph = preprocess_graph_nx(graph, largest_component_only, max_nodes, seed)
     original_ids = [graph.nodes[node].get("original_id", node) for node in range(graph.number_of_nodes())]
 
-    features = data.x.detach().cpu().numpy()[original_ids].astype(np.float32)
+    benchmark_features = data.x.detach().cpu().numpy()[original_ids].astype(np.float32)
+    features, feature_names = combine_base_and_structural_features(
+        benchmark_features, graph, feature_mode=feature_mode
+    )
     labels = data.y.detach().cpu().numpy()[original_ids].astype(int)
     node_table = make_node_table(graph)
 
@@ -531,7 +694,12 @@ def load_benchmark_dataset(
         labels=labels,
         known_k=int(dataset.num_classes),
         node_table=node_table,
-        source_description=f"Benchmark dataset: {dataset_name}",
+        source_description=(
+            f"Benchmark dataset: {dataset_name}; feature_mode={feature_mode}; "
+            f"feature_count={features.shape[1]}"
+        ),
+        feature_names=feature_names,
+        feature_mode=feature_mode,
     )
 
 
@@ -647,14 +815,15 @@ def load_uploaded_dataset(
     labels_df: Optional[pd.DataFrame] = None,
     label_node_col: Optional[str] = None,
     label_col: Optional[str] = None,
+    feature_mode: str = "combined",
 ) -> LoadedGraph:
     graph = read_edges_auto(edge_path, source_col, target_col)
     graph = preprocess_graph_nx(graph, largest_component_only, max_nodes, seed)
 
-    if features_df is not None:
-        features = align_feature_file(graph, features_df, feature_node_col)
-    else:
-        features = build_structural_features(graph)
+    uploaded_features = align_feature_file(graph, features_df, feature_node_col) if features_df is not None else None
+    features, feature_names = combine_base_and_structural_features(
+        uploaded_features, graph, feature_mode=feature_mode
+    )
 
     labels = align_label_file(graph, labels_df, label_node_col, label_col) if labels_df is not None else None
     known_k = int(len(np.unique(labels))) if labels is not None else None
@@ -666,7 +835,12 @@ def load_uploaded_dataset(
         labels=labels,
         known_k=known_k,
         node_table=node_table,
-        source_description="Uploaded edge-list dataset",
+        source_description=(
+            f"Uploaded edge-list dataset; feature_mode={feature_mode}; "
+            f"feature_count={features.shape[1]}"
+        ),
+        feature_names=feature_names,
+        feature_mode=feature_mode,
     )
 
 
@@ -953,7 +1127,8 @@ def representative_nodes(
                     "proximity": float(proximity[idx]),
                     "reason": (
                         "High representative score because it is close to the community centroid "
-                        "and has strong internal connectivity within the same community."
+                        "and has strong internal connectivity within the same community. The embedding "
+                        "used for this assignment is also informed by the structural feature team."
                     ),
                 }
             )
@@ -995,6 +1170,120 @@ def pca_projection(X: np.ndarray, labels: np.ndarray, sample_size: int = 5_000, 
             "community": labels[idx].astype(str),
         }
     )
+
+
+def run_scalability_analysis(
+    loaded: LoadedGraph,
+    base_cfg: ModelConfig,
+    scale_cfg: ScalabilityConfig,
+    device_preference: str = "auto",
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> pd.DataFrame:
+    """
+    Run repeated scalability tests over fixed graph sample sizes.
+
+    The function keeps failed/skipped trials in the output so the scalability
+    experiment remains auditable and easy to diagnose in Streamlit.
+    """
+    rows: List[Dict[str, Any]] = []
+    total_nodes = loaded.graph.number_of_nodes()
+
+    for requested_nodes in scale_cfg.node_sizes:
+        if requested_nodes > total_nodes and scale_cfg.skip_sizes_larger_than_graph:
+            row = {
+                "requested_nodes": int(requested_nodes),
+                "actual_nodes": None,
+                "edges": None,
+                "trial": None,
+                "seed": None,
+                "sampling_method": scale_cfg.sampling_method,
+                "status": "skipped",
+                "error": "Requested sample size is larger than the source graph.",
+            }
+            rows.append(row)
+            if progress_callback is not None:
+                progress_callback(row)
+            continue
+
+        for trial in range(1, scale_cfg.repeats + 1):
+            trial_seed = int(scale_cfg.seed + requested_nodes * 100 + trial)
+            row_base: Dict[str, Any] = {
+                "requested_nodes": int(requested_nodes),
+                "trial": int(trial),
+                "seed": int(trial_seed),
+                "sampling_method": scale_cfg.sampling_method,
+            }
+
+            try:
+                sampling_start = time.time()
+                sampled_loaded = sample_loaded_graph_for_scalability(
+                    loaded=loaded,
+                    target_nodes=int(requested_nodes),
+                    seed=trial_seed,
+                    method=scale_cfg.sampling_method,
+                    largest_component_only=scale_cfg.largest_component_only,
+                    use_sample_label_count_for_k=scale_cfg.use_sample_label_count_for_k,
+                )
+                sampling_seconds = time.time() - sampling_start
+
+                trial_cfg = _build_scalability_trial_config(
+                    base_cfg=base_cfg,
+                    scale_cfg=scale_cfg,
+                    seed=trial_seed,
+                )
+
+                result = run_gatpso_pipeline(
+                    loaded=sampled_loaded,
+                    cfg=trial_cfg,
+                    device_preference=device_preference,
+                )
+
+                final_row = _extract_final_model_row(result["results_df"])
+                summary = result["summary"]
+                runtime = result["runtime"]
+
+                row = {
+                    **row_base,
+                    "actual_nodes": int(summary["nodes"]),
+                    "edges": int(summary["edges"]),
+                    "features": int(sampled_loaded.features.shape[1]),
+                    "feature_mode": sampled_loaded.feature_mode,
+                    "selected_k": int(summary["selected_k"]),
+                    "communities": int(summary["communities"]),
+                    "sampling_seconds": float(sampling_seconds),
+                    "train_seconds": float(runtime["train_seconds"]),
+                    "pso_seconds": float(runtime["pso_seconds"]),
+                    "total_seconds": float(runtime["total_seconds"]),
+                    "memory_mb": float(runtime["memory_mb"]),
+                    "memory_delta_mb": float(runtime["memory_delta_mb"]),
+                    "model": final_row.get("model"),
+                    "score": final_row.get("score"),
+                    "modularity": final_row.get("modularity"),
+                    "separation": final_row.get("separation"),
+                    "conductance": final_row.get("conductance"),
+                    "NMI": final_row.get("NMI"),
+                    "ARI": final_row.get("ARI"),
+                    "status": "ok",
+                    "error": None,
+                }
+            except Exception as exc:
+                row = {
+                    **row_base,
+                    "actual_nodes": None,
+                    "edges": None,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+
+            rows.append(row)
+            if progress_callback is not None:
+                progress_callback(row)
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return pd.DataFrame(rows)
 
 
 def run_gatpso_pipeline(
@@ -1088,6 +1377,8 @@ def run_gatpso_pipeline(
         "source_description": loaded.source_description,
         "graph": loaded.graph,
         "features_shape": tuple(loaded.features.shape),
+        "feature_names": loaded.feature_names,
+        "feature_mode": loaded.feature_mode,
         "node_table": loaded.node_table,
         "labels": final_labels,
         "label_table": label_table,
@@ -1110,134 +1401,3 @@ def run_gatpso_pipeline(
             **runtime,
         },
     }
-
-
-def run_scalability_analysis(
-    loaded: LoadedGraph,
-    base_cfg: ModelConfig,
-    scale_cfg: ScalabilityConfig,
-    device_preference: str = "auto",
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-) -> pd.DataFrame:
-    """
-    Run repeated scalability tests over fixed sample sizes.
-
-    The function returns one row per trial. Failed or skipped trials are retained
-    with a status and error message so that scalability testing remains auditable.
-    """
-    rows: List[Dict[str, Any]] = []
-    total_nodes = loaded.graph.number_of_nodes()
-
-    for requested_nodes in scale_cfg.node_sizes:
-        if requested_nodes > total_nodes and scale_cfg.skip_sizes_larger_than_graph:
-            row = {
-                "requested_nodes": int(requested_nodes),
-                "actual_nodes": None,
-                "edges": None,
-                "trial": None,
-                "seed": None,
-                "sampling_method": scale_cfg.sampling_method,
-                "status": "skipped",
-                "error": "Requested sample size is larger than the source graph.",
-            }
-            rows.append(row)
-            if progress_callback is not None:
-                progress_callback(row)
-            continue
-
-        for trial in range(1, scale_cfg.repeats + 1):
-            trial_seed = int(scale_cfg.seed + requested_nodes * 100 + trial)
-            row_base: Dict[str, Any] = {
-                "requested_nodes": int(requested_nodes),
-                "trial": int(trial),
-                "seed": int(trial_seed),
-                "sampling_method": scale_cfg.sampling_method,
-            }
-
-            try:
-                sampling_start = time.time()
-                sampled_loaded = sample_loaded_graph_for_scalability(
-                    loaded=loaded,
-                    target_nodes=int(requested_nodes),
-                    seed=trial_seed,
-                    method=scale_cfg.sampling_method,
-                    largest_component_only=scale_cfg.largest_component_only,
-                    use_sample_label_count_for_k=scale_cfg.use_sample_label_count_for_k,
-                )
-                sampling_seconds = time.time() - sampling_start
-
-                trial_cfg = _build_scalability_trial_config(
-                    base_cfg=base_cfg,
-                    scale_cfg=scale_cfg,
-                    seed=trial_seed,
-                )
-
-                result = run_gatpso_pipeline(
-                    loaded=sampled_loaded,
-                    cfg=trial_cfg,
-                    device_preference=device_preference,
-                )
-
-                final_row = _extract_final_model_row(result["results_df"])
-                summary = result["summary"]
-                runtime = result["runtime"]
-
-                row = {
-                    **row_base,
-                    "actual_nodes": int(summary.get("nodes", sampled_loaded.graph.number_of_nodes())),
-                    "edges": int(summary.get("edges", sampled_loaded.graph.number_of_edges())),
-                    "features": int(sampled_loaded.features.shape[1]),
-                    "selected_k": int(summary.get("selected_k", result.get("selected_k", 0))),
-                    "communities": int(summary.get("communities", 0)),
-                    "sampling_seconds": float(sampling_seconds),
-                    "train_seconds": float(runtime.get("train_seconds", np.nan)),
-                    "pso_seconds": float(runtime.get("pso_seconds", np.nan)),
-                    "total_seconds": float(runtime.get("total_seconds", np.nan)),
-                    "memory_mb": float(runtime.get("memory_mb", np.nan)),
-                    "memory_delta_mb": float(runtime.get("memory_delta_mb", np.nan)),
-                    "model": final_row.get("model"),
-                    "score": final_row.get("score"),
-                    "modularity": final_row.get("modularity"),
-                    "separation": final_row.get("separation"),
-                    "conductance": final_row.get("conductance"),
-                    "NMI": final_row.get("NMI"),
-                    "ARI": final_row.get("ARI"),
-                    "status": "ok",
-                    "error": None,
-                }
-
-            except Exception as exc:
-                row = {
-                    **row_base,
-                    "actual_nodes": None,
-                    "edges": None,
-                    "features": None,
-                    "selected_k": None,
-                    "communities": None,
-                    "sampling_seconds": None,
-                    "train_seconds": None,
-                    "pso_seconds": None,
-                    "total_seconds": None,
-                    "memory_mb": None,
-                    "memory_delta_mb": None,
-                    "model": None,
-                    "score": None,
-                    "modularity": None,
-                    "separation": None,
-                    "conductance": None,
-                    "NMI": None,
-                    "ARI": None,
-                    "status": "failed",
-                    "error": str(exc),
-                }
-
-            rows.append(row)
-            if progress_callback is not None:
-                progress_callback(row)
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    return pd.DataFrame(rows)
-
