@@ -1,4 +1,3 @@
-"""Streamlit interface for the GAT/DGI + PSO community detection model."""
 
 from __future__ import annotations
 
@@ -413,11 +412,10 @@ def build_result_zip(result: Dict) -> bytes:
 st.markdown(
     """
     <div class="hero-card">
-        <div class="hero-title">Community Detection with GATPSO hybrid model</div>
+        <div class="hero-title">GAT-PSO Community Detection Web App</div>
         <div class="hero-subtitle">
             Upload your own graph dataset or run benchmark datasets such as Cora, PubMed and Citeseer.
-            The app trains a GAT/DGI embedding model, applies K-means and PSO, then explains the detected
-            communities, metrics and representative nodes.
+            
         </div>
     </div>
     """,
@@ -675,7 +673,8 @@ else:
     with tab_reps:
         st.markdown(
             """
-            ###The app uses the same reasoning as the notebook: a representative node should be both **central in the embedding space** and **well connected inside its own community**.
+            ### How representative nodes are selected
+            The app uses the same reasoning as the notebook: a representative node should be both **central in the embedding space** and **well connected inside its own community**.
 
             **Representative score = 0.5 × centroid proximity + 0.5 × normalized intra-community degree**
 
@@ -732,7 +731,7 @@ else:
         f"Available nodes: {total_available_nodes:,} | Available edges: {loaded_for_scaling.graph.number_of_edges():,}"
     )
 
-    with st.expander("Scalability Test Configurations", expanded=False):
+    with st.expander("Configure Scalability Test", expanded=False):
         default_node_sizes = "500,1000,1500,2000,2500"
         if total_available_nodes < 2500:
             candidates = sorted({max(2, int(total_available_nodes * pct)) for pct in (0.25, 0.50, 0.75, 1.00)})
