@@ -117,7 +117,7 @@ CUSTOM_CSS = """
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-PLOTLY_TEMPLATE = "plotly_dark"
+PLOTLY_TEMPLATE = "plotly_white"
 DEVICE_PREFERENCE = "auto"
 
 
